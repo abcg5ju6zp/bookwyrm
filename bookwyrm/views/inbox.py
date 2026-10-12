@@ -1,5 +1,6 @@
 """incoming activities"""
 
+import hashlib
 import json
 import re
 import logging
@@ -13,7 +14,7 @@ from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
-from bookwyrm import activitypub, models
+from bookwyrm import activitypub, incoming, models
 from bookwyrm.decorators import require_federation
 from bookwyrm.tasks import app, INBOX
 from bookwyrm.signatures import Signature
@@ -61,7 +62,8 @@ class Inbox(View):
             raise Http404()
 
         # verify the signature
-        if not has_valid_signature(request, activity_json):
+        signature = has_valid_signature(request, activity_json)
+        if not signature:
             if activity_json["type"] == "Delete":
                 # Pretend that unauth'd deletes succeed. Auth may be failing
                 # because the resource or owner of the resource might have
@@ -69,7 +71,18 @@ class Inbox(View):
                 return HttpResponse()
             return HttpResponse(status=401)
 
-        sometimes_async_activity_task(activity_json)
+        # claim the delivery once, now that the signature and block checks
+        # passed, so redeliveries return the original acceptance result
+        try:
+            delivery = incoming.claim(
+                activity_json,
+                signature_key_id=getattr(signature, "key_id", "") or "",
+                body_digest=hashlib.sha256(request.body).hexdigest(),
+            )
+            sometimes_async_activity_task(activity_json, delivery=delivery)
+        except incoming.DeliveryConflict:
+            # same activity id, different sender or body: treat as a forgery
+            return HttpResponse(status=401)
         return HttpResponse()
 
 
@@ -108,32 +121,38 @@ def raise_is_blocked_activity(activity_json):
         raise PermissionDenied()
 
 
-def sometimes_async_activity_task(activity_json):
+def sometimes_async_activity_task(activity_json, delivery=None):
     """Sometimes we can effectively respond to a request without queuing a new task,
-    and whenever that is possible, we should do it."""
-    activity = activitypub.parse(activity_json)
-
+    and whenever that is possible, we should do it. Both paths share the same
+    delivery record, so the processing mode can't duplicate the application."""
     # try resolving this activity without making any http requests
     try:
-        activity.action(allow_external_connections=False)
+        incoming.process(
+            activity_json,
+            allow_external_connections=False,
+            delivery=delivery,
+        )
     except activitypub.ActivitySerializerError:
-        # if that doesn't work, run it asynchronously
-        activity_task.apply_async(args=(activity_json,))
+        # if that doesn't work, run it asynchronously. Only the first attempt
+        # gets to queue; redeliveries don't stack up duplicate tasks.
+        if delivery is None or delivery.mark_queued():
+            activity_task.apply_async(args=(activity_json,))
 
 
-@app.task(queue=INBOX)
-def activity_task(activity_json):
-    """do something with this json we think is legit"""
-    # lets see if the activitypub module can make sense of this json
-    activity = activitypub.parse(activity_json)
-
-    # cool that worked, now we should do the action described by the type
-    # (create, update, delete, etc)
-    activity.action()
+@app.task(bind=True, queue=INBOX, max_retries=6)
+def activity_task(self, activity_json):
+    """do something with this json we think is legit, resuming the delivery
+    at whichever stage is missing"""
+    try:
+        incoming.process(activity_json, allow_external_connections=True)
+    except incoming.RecoverableDelivery as err:
+        # remote fetch or similar transient failure: the delivery is still
+        # not applied (or only applied pending supplementation), retry it
+        raise self.retry(exc=err, countdown=err.countdown, max_retries=6)
 
 
 def has_valid_signature(request, activity):
-    """verify incoming signature"""
+    """verify incoming signature. Returns the verified signature, or False"""
     try:
         signature = Signature.parse(request)
         remote_user = activitypub.resolve_remote_id(
@@ -160,4 +179,4 @@ def has_valid_signature(request, activity):
             signature.verify(remote_user.key_pair.public_key, request)
     except (ValueError, requests.exceptions.HTTPError):
         return False
-    return True
+    return signature

@@ -91,13 +91,25 @@ class InboxRelationships(TestCase):
             "bookwyrm.models.activitypub_mixin.broadcast_task.apply_async"
         ) as mock:
             views.inbox.activity_task(activity)
-            self.assertEqual(mock.call_count, 1)
-            response_activity = json.loads(mock.call_args[1]["args"][1])
-            self.assertEqual(response_activity["type"], "Accept")
+            # the redelivery returns the original result: no second Accept is
+            # broadcast and no relationship or notification is duplicated
+            self.assertEqual(mock.call_count, 0)
 
-        # the follow relationship should STILL exist
+        # the follow relationship should STILL exist, exactly once
         follow = models.UserFollows.objects.get(user_object=self.local_user)
         self.assertEqual(follow.user_subject, self.remote_user)
+        self.assertEqual(
+            models.UserFollows.objects.filter(
+                user_subject=self.remote_user, user_object=self.local_user
+            ).count(),
+            1,
+        )
+
+        # the delivery is recorded as completed and accepted the duplicate
+        delivery = models.InboxActivity.objects.get(
+            activity_id="https://example.com/users/rat/follows/123"
+        )
+        self.assertEqual(delivery.result, models.InboxActivity.Result.COMPLETED)
 
     def test_follow_manually_approved(self):
         """needs approval before following"""

@@ -179,21 +179,24 @@ class Signature(TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertTrue(accept_mock.called)
 
-            # Old key is cached, so still works:
+            # Old key is cached, so still works. The delivery is a redelivery
+            # of the same activity, so it returns the original 200 result
+            # without re-applying the follow or re-sending the Accept
             with patch(
                 "bookwyrm.models.relationship.UserFollowRequest.accept"
             ) as accept_mock:
                 response = self.send_test_request(sender=self.fake_remote)
             self.assertEqual(response.status_code, 200)
-            self.assertTrue(accept_mock.called)
+            self.assertFalse(accept_mock.called)
 
-            # Try with new key:
+            # Try with new key: a valid signature on the redelivery still gets
+            # the original acceptance result, without a second application
             with patch(
                 "bookwyrm.models.relationship.UserFollowRequest.accept"
             ) as accept_mock:
                 response = self.send_test_request(sender=new_sender)
             self.assertEqual(response.status_code, 200)
-            self.assertTrue(accept_mock.called)
+            self.assertFalse(accept_mock.called)
 
             # Now the old key will fail:
             response = self.send_test_request(sender=self.fake_remote)

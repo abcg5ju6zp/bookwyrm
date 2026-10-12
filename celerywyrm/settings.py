@@ -31,6 +31,14 @@ CELERY_RESULT_SERIALIZER = "json"
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 CELERY_TIMEZONE = env("TIME_ZONE", "UTC")
 
+# resume inbox deliveries abandoned by a killed/restarted worker
+CELERY_BEAT_SCHEDULE = {
+    "recover-stale-inbox-deliveries": {
+        "task": "bookwyrm.incoming.recover_stale_deliveries_task",
+        "schedule": 300.0,
+    },
+}
+
 CELERY_WORKER_CONCURRENCY = env("CELERY_WORKER_CONCURRENCY", None)
 CELERY_TASK_SOFT_TIME_LIMIT = env("CELERY_TASK_SOFT_TIME_LIMIT", None)
 

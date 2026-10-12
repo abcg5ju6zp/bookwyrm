@@ -51,7 +51,7 @@ class ActivityEncoder(JSONEncoder):
 
 
 @contextmanager
-def item_lock(object_id: str) -> Generator[ResponseT, None, None]:
+def item_lock(object_id: str, prefix: str = "lock") -> Generator[ResponseT, None, None]:
     """Set a mutex lock on an incoming item to prevent race conditions causing duplicates"""
 
     # hash the remote id so the key is a reasonable length
@@ -59,7 +59,7 @@ def item_lock(object_id: str) -> Generator[ResponseT, None, None]:
         id_hash = md5(object_id.encode("utf-8")).hexdigest()
     except AttributeError:
         raise ActivitySerializerError("Incoming object has no identifier")
-    lock_id = f"lock:{id_hash}"
+    lock_id = f"{prefix}:{id_hash}"
     # expire after enough time to make up to ~59 queries
     expire_seconds = time.monotonic() + (QUERY_TIMEOUT * 60)
     # try to get the lock until you have it or it has (nearly) expired

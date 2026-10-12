@@ -35,6 +35,9 @@ class BookwyrmConfig(AppConfig):
 
     def ready(self):
         """set up OTLP and preview image files, if desired"""
+        # register inbox delivery tasks with the Celery worker
+        from bookwyrm import incoming  # noqa: F401
+
         if settings.OTEL_EXPORTER_OTLP_ENDPOINT or settings.OTEL_EXPORTER_CONSOLE:
             from bookwyrm.telemetry import open_telemetry
 
