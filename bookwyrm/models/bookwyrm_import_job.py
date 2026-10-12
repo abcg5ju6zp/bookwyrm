@@ -1,5 +1,6 @@
 """Import a user from another Bookwyrm instance"""
 
+import datetime
 import json
 import logging
 import math
@@ -10,13 +11,17 @@ from botocore.exceptions import EndpointConnectionError
 import requests
 
 from django.apps import apps
+from django.db import transaction
 from django.db.models import (
     BooleanField,
+    CharField,
     ForeignKey,
     FileField,
     JSONField,
+    PositiveIntegerField,
     QuerySet,
     TextChoices,
+    Q,
     PROTECT,
     SET_NULL,
 )
@@ -28,11 +33,15 @@ from django.contrib.postgres.fields import ArrayField as DjangoArrayField
 
 from bookwyrm import activitypub, models, settings
 from bookwyrm.connectors import connector_manager
-from bookwyrm.tasks import app, IMPORTS
+from bookwyrm.tasks import app, IMPORTS, MISC
 from bookwyrm.models.job import Job, ParentJob, ChildJob, ParentTask, SubTask
 from bookwyrm.utils.tar import BookwyrmTarFile
 
 logger = logging.getLogger(__name__)
+
+# a child task which has stayed ACTIVE for this long is presumed dead
+# (worker crash or lost completion callback) and can be claimed again
+STALE_TASK_LIMIT = datetime.timedelta(hours=1)
 
 
 def select_exports_storage() -> Storage:
@@ -49,10 +58,81 @@ class BookwyrmImportJob(ParentJob):
         models.fields.CharField(max_length=50, blank=True), blank=True
     )
     retry = BooleanField(default=False)
+    # sha256 digest of the uploaded archive. Together with the generation
+    # it identifies the import lineage: re-uploading the same archive does
+    # not create a competing set of tasks.
+    archive_hash = CharField(max_length=64, null=True, blank=True, db_index=True)
+    generation = PositiveIntegerField(default=1)
+    source_job = ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=SET_NULL,
+        related_name="retry_jobs",
+    )
+
+    # uniqueness of (user, archive_hash, generation) is enforced when
+    # jobs are created (see BookwyrmImporter) by locking the user row;
+    # a database constraint cannot span the parent table (user_id) and
+    # this child table.
 
     def start_job(self) -> None:
-        """Start the job"""
+        """Start the job. Does nothing if the job is already running
+        (for example when an uploaded archive is taken over)"""
+
+        if self.complete or self.status != self.Status.PENDING:
+            return
         start_import_task.delay(job_id=self.id)
+
+    @property
+    def lineage(self) -> QuerySet["BookwyrmImportJob"]:
+        """all jobs created from the same archive for this user,
+        across generations (retries and re-uploads)"""
+        if not self.archive_hash:
+            return BookwyrmImportJob.objects.filter(id=self.id)
+        return BookwyrmImportJob.objects.filter(
+            user=self.user, archive_hash=self.archive_hash
+        )
+
+    @property
+    def is_superseded(self) -> bool:
+        """has a newer generation of this archive been started?"""
+        return self.lineage.filter(generation__gt=self.generation).exists()
+
+    @property
+    def is_live(self) -> bool:
+        """may tasks for this job still write data?
+
+        Stops old generations after a re-upload, stopped jobs and tasks
+        belonging to deactivated users from overwriting later changes.
+        """
+        return (
+            not self.complete
+            and self.status != self.Status.STOPPED
+            and self.user.is_active
+            and not self.is_superseded
+        )
+
+    def lineage_child(self, model, **filters) -> QuerySet:
+        """child tasks of any generation of this archive"""
+        children = model.objects.filter(
+            parent_job__user=self.user,
+            **filters,
+        )
+        if self.archive_hash:
+            # parent_job points at the ParentJob base table; archive_hash
+            # lives on the BookwyrmImportJob inheritance child
+            children = children.filter(
+                parent_job__bookwyrmimportjob__archive_hash=self.archive_hash
+            )
+        else:
+            children = children.filter(parent_job=self)
+        return children
+
+    def stop_superseded_jobs(self) -> None:
+        """revoke any older, still-running generation of this archive"""
+        for older in self.lineage.exclude(id=self.id).filter(complete=False):
+            older.stop_job()
 
     @property
     def book_tasks(self) -> QuerySet["UserImportBook"]:
@@ -72,7 +152,11 @@ class BookwyrmImportJob(ParentJob):
     @property
     def item_count(self) -> int:
         """How many total tasks are there?"""
-        return self.book_tasks.count() + self.status_tasks.count()
+        return (
+            self.book_tasks.count()
+            + self.status_tasks.count()
+            + self.relationship_tasks.count()
+        )
 
     @property
     def pending_item_count(self) -> int:
@@ -100,13 +184,26 @@ class BookwyrmImportJob(ParentJob):
             return 0
         return math.floor((item_count - self.pending_item_count) / item_count * 100)
 
+    def archive_is_referenced(self) -> bool:
+        """is another job still pointing at the same stored archive?"""
+        if not self.archive_file.name:
+            return False
+        return BookwyrmImportJob.objects.exclude(id=self.id).filter(
+            archive_file=self.archive_file.name
+        ).exists()
+
+    def delete_archive_if_unreferenced(self) -> None:
+        """reclaim the archive storage once no job references it"""
+        if self.archive_file.name and not self.archive_is_referenced():
+            self.archive_file.delete(save=True)
+
     def complete_job(self) -> None:
         """Report that the job has completed and stop pending children."""
 
         super().complete_job()
 
-        # delete the import file
-        self.archive_file.delete(save=True)
+        # only delete the import file when no retry job references it
+        self.delete_archive_if_unreferenced()
 
     def notify_child_job_complete(self) -> None:
         """let the job know when the items get work done"""
@@ -118,6 +215,20 @@ class BookwyrmImportJob(ParentJob):
         self.save(update_fields=["updated_date"])
 
         if not self.complete and self.has_completed:
+            self.complete_job()
+
+    def evaluate_completion(self) -> None:
+        """Reconcile the parent job from the persisted child results
+        rather than from a single completion callback. Safe to call after
+        a restart or when a completion notification was lost."""
+
+        if self.complete:
+            return
+
+        self.updated_date = timezone.now()
+        self.save(update_fields=["updated_date"])
+
+        if self.has_completed:
             self.complete_job()
 
 
@@ -234,83 +345,241 @@ class UserImportSubTask(SubTask):
         subtask.complete_job()
 
 
-@app.task(queue=IMPORTS, base=ImportUserTask)
-def start_import_task(**kwargs) -> None:
-    """trigger the child import tasks for each user data
-    We always import the books even if not assigning
-    them to shelves, lists etc"""
-    job = BookwyrmImportJob.objects.get(id=kwargs["job_id"])
-    archive_file = job.bookwyrmimportjob.archive_file
+def book_item_key(book_data: dict[str, Any], index: int) -> str:
+    """stable identity for a book inside the archive"""
+    edition = book_data.get("edition") or {}
+    return f"book:{edition.get('id') or index}"
 
-    if job.status == "stopped":
-        return
 
-    job.status = "active"
-    job.save(update_fields=["status"])
+def post_item_key(book_key: str, status_type: str, status: dict, index: int) -> str:
+    """stable identity for a status inside the archive"""
+    return f"post:{status.get('id') or f'{book_key}-{status_type}-{index}'}"
+
+
+def relationship_item_key(relationship: str, remote_id: str) -> str:
+    """stable identity for a follow/block inside the archive"""
+    return f"rel:{relationship}:{remote_id}"
+
+
+# (model field on book_data, UserImportPost.StatusType value, required setting)
+POST_CATEGORIES = [
+    ("comments", UserImportPost.StatusType.COMMENT, "include_comments"),
+    ("quotations", UserImportPost.StatusType.QUOTE, "include_quotations"),
+    ("reviews", UserImportPost.StatusType.REVIEW, "include_reviews"),
+]
+
+
+def prior_item_is_complete(
+    job: BookwyrmImportJob, model, **filters
+) -> bool:
+    """has this archive item already been confirmed by an earlier
+    generation of this import?"""
+    return job.lineage_child(model, status=Job.Status.COMPLETE, **filters).exists()
+
+
+def create_post_children(
+    job: BookwyrmImportJob,
+    book: models.Edition,
+    book_key: str,
+    book_data: dict[str, Any],
+) -> None:
+    """create the stable set of status child tasks for one book.
+    Items already completed by an earlier generation are skipped, and
+    re-delivered or replayed runs reuse the same rows."""
+
+    for category, status_type, required_setting in POST_CATEGORIES:
+        if required_setting not in job.required:
+            continue
+        for index, status in enumerate(book_data.get(category) or []):
+            key = post_item_key(book_key, status_type, status, index)
+            if prior_item_is_complete(job, UserImportPost, item_key=key):
+                continue
+            UserImportPost.objects.get_or_create(
+                parent_job=job,
+                item_key=key,
+                defaults={
+                    "json": status,
+                    "book": book,
+                    "status_type": status_type,
+                },
+            )
+
+
+def create_book_children(job: BookwyrmImportJob, import_data: dict[str, Any]) -> None:
+    """create the stable set of book and status child tasks.
+
+    Books resolved by an earlier generation only re-claim statuses that
+    never completed; failed/unconfirmed books get a fresh task row."""
+
+    for index, book_data in enumerate(import_data.get("books") or []):
+        key = book_item_key(book_data, index)
+        prior = (
+            job.lineage_child(UserImportBook, item_key=key)
+            .filter(status=Job.Status.COMPLETE, book__isnull=False)
+            .order_by("-updated_date")
+            .first()
+        )
+        if prior is not None:
+            # the book and its shelves/readthroughs/lists are done,
+            # only orphaned statuses (if any) need to be claimed
+            create_post_children(job, prior.book, key, book_data)
+            continue
+
+        UserImportBook.objects.get_or_create(
+            parent_job=job,
+            item_key=key,
+            defaults={"book_data": book_data},
+        )
+
+
+def create_relationship_children(
+    job: BookwyrmImportJob, import_data: dict[str, Any]
+) -> None:
+    """create the stable set of follow/block child tasks"""
+
+    categories = [
+        ("follow", "include_follows", "follows"),
+        ("block", "include_blocks", "blocks"),
+    ]
+    for relationship, required_setting, data_key in categories:
+        if required_setting not in job.required:
+            continue
+        for remote_id in import_data.get(data_key) or []:
+            item_key = relationship_item_key(relationship, remote_id)
+            if prior_item_is_complete(
+                job, UserImportRelationship, item_key=item_key
+            ):
+                continue
+            UserImportRelationship.objects.get_or_create(
+                parent_job=job,
+                item_key=item_key,
+                defaults={
+                    "relationship": relationship,
+                    "remote_id": remote_id,
+                },
+            )
+
+
+def origin_is_reachable(import_data: dict[str, Any]) -> bool:
+    """check whether the source instance is still online.
+    If not, we don't bother trying to pull book data from it."""
 
     try:
-        archive_file.open("rb")
-        with BookwyrmTarFile.open(mode="r:gz", fileobj=archive_file) as tar:
-            json_filename = next(
-                filter(lambda n: n.startswith("archive"), tar.getnames())
+        url_parts = urlparse(import_data.get("id"))
+        url = f"{url_parts.scheme}://{url_parts.netloc}"
+        resp = requests.head(
+            url,
+            headers={
+                "User-Agent": settings.USER_AGENT,
+            },
+            timeout=settings.QUERY_TIMEOUT,
+        )
+        return resp.ok
+    except (
+        EndpointConnectionError,
+        requests.exceptions.ConnectionError,
+        ConnectionRefusedError,
+    ):
+        return False
+
+
+@app.task(queue=IMPORTS, base=ImportUserTask)
+def start_import_task(**kwargs) -> None:
+    """Build the stable manifest of child tasks and dispatch it.
+
+    Safe to run more than once (queue redelivery, worker restart): it
+    reuses persisted import data and stable child identities, only
+    dispatches tasks that have not been confirmed, and reconciles the
+    parent job from persisted results at the end.
+    We always import the books even if not assigning
+    them to shelves, lists etc"""
+
+    try:
+        with transaction.atomic():
+            # serialize concurrent (re)deliveries of the start task
+            job = BookwyrmImportJob.objects.select_for_update().get(
+                id=kwargs["job_id"]
             )
-            job.import_data = json.loads(tar.read(json_filename).decode("utf-8"))
 
-            if "include_user_profile" in job.required:
-                update_user_profile(job.user, tar, job.import_data)
-            if "include_user_settings" in job.required:
-                update_user_settings(job.user, job.import_data)
-            if "include_goals" in job.required:
-                update_goals(job.user, job.import_data.get("goals", []))
-            if "include_saved_lists" in job.required:
-                upsert_saved_lists(job.user, job.import_data.get("saved_lists", []))
-            if "include_follows" in job.required:
-                for remote_id in job.import_data.get("follows", []):
-                    UserImportRelationship.objects.create(
-                        parent_job=job, remote_id=remote_id, relationship="follow"
-                    )
-            if "include_blocks" in job.required:
-                for remote_id in job.import_data.get("blocks", []):
-                    UserImportRelationship.objects.create(
-                        parent_job=job, remote_id=remote_id, relationship="block"
-                    )
+            if job.complete or job.status == Job.Status.STOPPED:
+                return
 
-            for item in UserImportRelationship.objects.filter(parent_job=job).all():
+            if not job.user.is_active or job.is_superseded:
+                # user deactivated or a newer upload took over:
+                # stop this generation in its tracks
+                job.stop_job()
+                return
+
+            job.set_status(Job.Status.ACTIVE)
+
+            if job.import_data is None:
+                archive_file = job.archive_file
+                archive_file.open("rb")
+                with BookwyrmTarFile.open(
+                    mode="r:gz", fileobj=archive_file
+                ) as tar:
+                    json_filename = next(
+                        filter(lambda n: n.startswith("archive"), tar.getnames())
+                    )
+                    job.import_data = json.loads(
+                        tar.read(json_filename).decode("utf-8")
+                    )
+                    job.save(update_fields=["import_data"])
+
+                    # profile/settings/goals are applied a single time by
+                    # the generation that first opens the archive, so a
+                    # retry can't overwrite later changes
+                    applies_user_data = not job.lineage.exclude(id=job.id).filter(
+                        generation__lt=job.generation,
+                        import_data__isnull=False,
+                    ).exists()
+                    if applies_user_data and job.is_live:
+                        if "include_user_profile" in job.required:
+                            update_user_profile(job.user, tar, job.import_data)
+                        if "include_user_settings" in job.required:
+                            update_user_settings(job.user, job.import_data)
+                        if "include_goals" in job.required:
+                            update_goals(job.user, job.import_data.get("goals", []))
+                        if "include_saved_lists" in job.required:
+                            upsert_saved_lists(
+                                job.user, job.import_data.get("saved_lists", [])
+                            )
+                archive_file.close()
+
+            # one stable manifest per category; each category is
+            # independent so one failing class cannot block the others
+            create_relationship_children(job, job.import_data)
+            create_book_children(job, job.import_data)
+
+            # empty manifest (nothing selected / empty categories):
+            # converge the parent immediately instead of waiting for a
+            # child callback
+            job.evaluate_completion()
+
+        # network and queue dispatch happen outside the row lock, once
+        # the manifest has been committed
+        if not job.complete and job.is_live:
+            origin_ok = origin_is_reachable(job.import_data)
+
+            # dispatch only unclaimed tasks; completed or in-flight
+            # children are left alone
+            for item in job.relationship_tasks.filter(status=Job.Status.PENDING):
                 item.start_job()
-
-            try:
-                url_parts = urlparse(job.import_data.get("id"))
-                url = f"{url_parts.scheme}://{url_parts.netloc}"
-                # Check https://example.com to see if the instance is still online
-                # If not, we don't bother trying to pull book data from it.
-                resp = requests.head(
-                    url,
-                    headers={
-                        "User-Agent": settings.USER_AGENT,
-                    },
-                    timeout=settings.QUERY_TIMEOUT,
-                )
-
-                origin_is_ok = resp.ok
-
-            except (
-                EndpointConnectionError,
-                requests.exceptions.ConnectionError,
-                ConnectionRefusedError,
-            ):
-                origin_is_ok = False
-
-            for data in job.import_data.get("books"):
-                book_job = UserImportBook.objects.create(parent_job=job, book_data=data)
-                book_job.start_job(origin_is_ok=origin_is_ok)
-
-        archive_file.close()
+            for item in job.book_tasks.filter(status=Job.Status.PENDING):
+                item.start_job(origin_is_ok=origin_ok)
+            for item in job.status_tasks.filter(status=Job.Status.PENDING):
+                item.start_job()
 
     except Exception as err:
         logger.error(
-            "User Import Job %s Failed with error: %s", job.id, err, exc_info=True
+            "User Import Job %s Failed with error: %s",
+            kwargs["job_id"],
+            err,
+            exc_info=True,
         )
-        job.set_status("failed")
+        job = BookwyrmImportJob.objects.filter(id=kwargs["job_id"]).first()
+        if job is not None and not job.complete:
+            job.set_status(Job.Status.FAILED)
 
 
 def create_book_from_json(book_data: dict[str, Any]) -> models.Edition:
@@ -354,17 +623,18 @@ def import_book_task(**kwargs) -> None:
     find or create the edition and work in the database"""
 
     task = UserImportBook.objects.get(id=kwargs["child_id"])
-    job = task.parent_job
+    job = BookwyrmImportJob.objects.get(id=task.parent_job_id)
     book_data = task.book_data
 
-    if task.complete or job.status == "stopped":
+    if task.complete or not job.is_live:
         return
 
+    book = None
     try:
         edition = book_data.get("edition")
         book = models.Edition.find_existing(edition)
         if not book:
-            if kwargs["origin_is_ok"]:
+            if kwargs.get("origin_is_ok"):
                 # try importing from the instance the user is coming from
                 remote_id = edition.get("id")
                 connector = connector_manager.get_or_create_connector(remote_id)
@@ -377,57 +647,43 @@ def import_book_task(**kwargs) -> None:
 
         task.book = book
         task.save(update_fields=["book"])
-        required = task.parent_job.bookwyrmimportjob.required
 
-        if "include_shelves" in required:
-            upsert_shelves(task.parent_job.user, book, book_data.get("shelves"))
+        if "include_shelves" in job.required:
+            upsert_shelves(job.user, book, book_data.get("shelves"))
 
-        if "include_readthroughs" in required:
+        if "include_readthroughs" in job.required:
             upsert_readthroughs(
-                task.parent_job.user, book.id, book_data.get("readthroughs")
+                job.user, book.id, book_data.get("readthroughs")
             )
 
-        if "include_lists" in required:
-            upsert_lists(task.parent_job.user, book.id, book_data.get("lists"))
+        if "include_lists" in job.required:
+            upsert_lists(job.user, book.id, book_data.get("lists"))
 
     except Exception as err:
+        # a single bad remote book fails just this child; other books,
+        # statuses and relationships keep going. Do not create statuses
+        # pointing at a missing book.
         logger.error(
-            "Book Import Task %s for Job %s Failed with error: %s", task.id, job.id, err
+            "Book Import Task %s for Job %s Failed with error: %s",
+            task.id,
+            job.id,
+            err,
+            exc_info=True,
         )
         task.fail_reason = _("Unknown error importing book")
         task.save(update_fields=["fail_reason"])
-        task.set_status("failed")
+        task.set_status(Job.Status.FAILED)
+        return
 
     # Now import statuses
-    # These are also subtasks so that we can isolate anything that fails
-    if "include_comments" in job.bookwyrmimportjob.required:
-        for status in book_data.get("comments"):
-            UserImportPost.objects.create(
-                parent_job=task.parent_job,
-                json=status,
-                book=book,
-                status_type=UserImportPost.StatusType.COMMENT,
-            )
+    # These are also subtasks so that we can isolate anything that fails.
+    # Stable item keys make replay and redelivery idempotent.
+    book_key = task.item_key or book_item_key(book_data, 0)
+    create_post_children(job, book, book_key, book_data)
 
-    if "include_quotations" in job.bookwyrmimportjob.required:
-        for status in book_data.get("quotations"):
-            UserImportPost.objects.create(
-                parent_job=task.parent_job,
-                json=status,
-                book=book,
-                status_type=UserImportPost.StatusType.QUOTE,
-            )
-
-    if "include_reviews" in job.bookwyrmimportjob.required:
-        for status in book_data.get("reviews"):
-            UserImportPost.objects.create(
-                parent_job=task.parent_job,
-                json=status,
-                book=book,
-                status_type=UserImportPost.StatusType.REVIEW,
-            )
-
-    for item in UserImportPost.objects.filter(parent_job=job).all():
+    # only dispatch this book's unclaimed posts, not every post of
+    # the parent job (which other book tasks may still be creating)
+    for item in job.status_tasks.filter(book=book, status=Job.Status.PENDING):
         item.start_job()
 
     task.complete_job()
@@ -438,7 +694,7 @@ def upsert_status_task(**kwargs) -> None:
     """Find or create book statuses"""
 
     task = UserImportPost.objects.get(id=kwargs["child_id"])
-    job: ParentJob = task.parent_job
+    job = BookwyrmImportJob.objects.get(id=task.parent_job_id)
     user: models.User = job.user
     status: dict[str, Any] = task.json
     status_class = (
@@ -449,7 +705,7 @@ def upsert_status_task(**kwargs) -> None:
         else models.Comment
     )
 
-    if task.complete or job.status == "stopped":
+    if task.complete or not job.is_live:
         return
 
     try:
@@ -664,7 +920,12 @@ def import_user_relationship_task(**kwargs) -> None:
     """import a user follow or block from an import file"""
 
     task = UserImportRelationship.objects.get(id=kwargs["child_id"])
-    job = task.parent_job
+    job = BookwyrmImportJob.objects.get(id=task.parent_job_id)
+
+    # a re-delivered, completed task must never send follow/block
+    # side effects a second time, and stale generations must not run
+    if task.complete or not job.is_live:
+        return
 
     try:
         if task.relationship == "follow":
@@ -737,6 +998,84 @@ def import_user_relationship_task(**kwargs) -> None:
         task.fail_reason = _("Unkown error importing relationship")
         task.save(update_fields=["fail_reason"])
         task.set_status("failed")
+
+
+# recovery
+##########
+
+
+def _unclaimed_children(queryset, stale_before):
+    """pending children that either never got a queued message or whose
+    queued message is older than the stale-task threshold"""
+    return queryset.filter(status=Job.Status.PENDING).filter(
+        Q(task_id__isnull=True) | Q(updated_date__lt=stale_before)
+    )
+
+
+@app.task(queue=MISC)
+def recover_import_jobs_task(**kwargs) -> None:
+    """Reconcile unfinished user imports after queue redelivery, worker
+    crashes or a service restart.
+
+    Only unconfirmed children are re-claimed: completed children (in any
+    generation) are left untouched, failed children wait for an explicit
+    retry, and the parent job converges from its persisted results.
+    Intended to be run on an interval (like other maintenance tasks)."""
+
+    stale_before = timezone.now() - STALE_TASK_LIMIT
+    job_ids = list(
+        BookwyrmImportJob.objects.filter(complete=False).values_list(
+            "id", flat=True
+        )
+    )
+    for job_id in job_ids:
+        try:
+            recover_import_job(job_id, stale_before)
+        except Exception:
+            logger.exception(
+                "Failed to recover user import job %s", job_id
+            )
+
+
+def recover_import_job(job_id: int, stale_before=None) -> None:
+    """reconcile a single import job"""
+    job = BookwyrmImportJob.objects.get(id=job_id)
+    if job.complete:
+        return
+
+    if stale_before is None:
+        stale_before = timezone.now() - STALE_TASK_LIMIT
+
+    if not job.user.is_active or job.is_superseded:
+        # deactivated user or a newer upload: this generation is over
+        job.stop_job()
+        job.delete_archive_if_unreferenced()
+        return
+
+    # the start task itself never got through (no manifest persisted)
+    if job.import_data is None:
+        if job.task_id is None or job.updated_date < stale_before:
+            start_import_task.delay(job_id=job.id)
+        return
+
+    # children a worker claimed but never confirmed: reclaim them
+    for child in job.child_jobs.filter(status=Job.Status.ACTIVE).filter(
+        updated_date__lt=stale_before
+    ):
+        child.reopen()
+
+    # re-queue pending children whose message is missing or stale.
+    # failed children are NOT auto-retried here.
+    for item in _unclaimed_children(job.relationship_tasks, stale_before):
+        item.start_job()
+    for item in _unclaimed_children(job.book_tasks, stale_before):
+        item.start_job(origin_is_ok=False)
+    for item in _unclaimed_children(job.status_tasks, stale_before):
+        item.start_job()
+
+    # converge the parent from persisted child state even if the last
+    # completion callback was lost
+    job.evaluate_completion()
 
 
 # utilities

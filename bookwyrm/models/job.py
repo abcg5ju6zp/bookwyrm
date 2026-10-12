@@ -2,6 +2,7 @@
 
 from django.db import models
 from django.db import transaction
+from django.db.models import Q, UniqueConstraint
 from django.utils.translation import gettext_lazy as _
 from django.utils import timezone
 from bookwyrm.models.user import User
@@ -161,6 +162,20 @@ class ChildJob(Job):
     parent_job = models.ForeignKey(
         ParentJob, on_delete=models.CASCADE, related_name="child_jobs"
     )
+    # stable natural identity of the archive item this child handles;
+    # namespaced per child type ("book:...", "post:...", "rel:...")
+    item_key = models.CharField(max_length=255, null=True, blank=True)
+
+    class Meta:
+        """a given archive item produces at most one child task per job"""
+
+        constraints = [
+            UniqueConstraint(
+                fields=["parent_job", "item_key"],
+                name="unique_childjob_item",
+                condition=Q(item_key__isnull=False),
+            )
+        ]
 
     def set_status(self, status):
         """Set job and parent_job status. Extend."""
@@ -176,6 +191,24 @@ class ChildJob(Job):
         """Report to parent_job that the job has completed. Extend."""
         super().complete_job()
         self.parent_job.notify_child_job_complete()
+
+    def reopen(self):
+        """Reset a child that a worker claimed but never confirmed, so
+        that it can be picked up again after a crash or redelivery."""
+        self.task_id = None
+        self.status = self.Status.PENDING
+        self.complete = False
+        self.fail_reason = None
+        self.updated_date = timezone.now()
+        self.save(
+            update_fields=[
+                "task_id",
+                "status",
+                "complete",
+                "fail_reason",
+                "updated_date",
+            ]
+        )
 
 
 class ParentTask(app.Task):
