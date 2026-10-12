@@ -38,7 +38,8 @@ from .bookwyrm_import_job import (
     UserImportPost,
     import_book_task,
 )
-from .bookwyrm_export_job import BookwyrmExportJob
+from .bookwyrm_export_job import BookwyrmExportJob, ExportDownloadLease
+from .bookwyrm_export_job import maintain_export_storage_task
 
 from .move import MoveUser
 

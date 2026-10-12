@@ -1,6 +1,7 @@
 """cleanup tasks"""
 
 import inspect
+import logging
 import math
 from datetime import timedelta
 from itertools import chain
@@ -24,6 +25,8 @@ from bookwyrm.connectors.abstract_connector import get_data
 from bookwyrm.connectors.connector_manager import search
 from bookwyrm.tasks import app, MISC
 from bookwyrm.utils.images import set_cover_from_url
+
+logger = logging.getLogger(__name__)
 
 
 class CleanUpUserExportFilesJob(ParentJob):
@@ -99,8 +102,18 @@ def delete_user_export_file_task(**kwargs):
     else:
         export_id = kwargs.get("export_id")
         if export_id:
-            file = models.BookwyrmExportJob.objects.get(id=export_id)
-            file.export_data.delete()
+            export = models.BookwyrmExportJob.objects.get(id=export_id)
+            # a download that started (or a pre-signed url that is still
+            # valid) keeps this generation alive until the next cleanup run
+            if models.ExportDownloadLease.active_for(export):
+                logger.info(
+                    "keeping export %s: it has an active download reference",
+                    export.id,
+                )
+                return
+            from bookwyrm.models.bookwyrm_export_job import reap_export_generation
+
+            reap_export_generation(export)
 
 
 @app.task(queue=MISC)
@@ -115,6 +128,10 @@ def start_export_deletions(**kwargs):
     job = CleanUpUserExportFilesJob.objects.create(user=user, expiry_date=expiry_date)
 
     job.start_job()
+
+    # recover exports interrupted by a worker restart and reclaim storage
+    # objects (staging or published) that no generation row accounts for
+    models.maintain_export_storage_task.delay()
 
 
 class FindMissingCoversJob(ParentJob):

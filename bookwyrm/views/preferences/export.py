@@ -17,7 +17,7 @@ from django.utils import timezone
 from django.views import View
 from django.urls import reverse
 from django.utils.decorators import method_decorator
-from django.shortcuts import redirect
+from django.shortcuts import get_object_or_404, redirect
 
 from bookwyrm import models, settings
 from bookwyrm.models.bookwyrm_export_job import BookwyrmExportJob
@@ -183,7 +183,8 @@ class ExportUser(View):
         for job in self.user_jobs:
             export = {"job": job}
 
-            if job.export_data:
+            # staging or failed generations never expose a download link
+            if job.is_published:
                 try:
                     export["size"] = job.export_data.size
                     export["url"] = reverse("prefs-export-file", args=[job.task_id])
@@ -236,9 +237,17 @@ class ExportArchive(View):
 
     def get(self, request, archive_id):
         """download user export file"""
-        export = BookwyrmExportJob.objects.get(task_id=archive_id, user=request.user)
+        export = get_object_or_404(
+            BookwyrmExportJob, task_id=archive_id, user=request.user
+        )
+
+        # only the atomically published generation is downloadable
+        if not export.is_published:
+            raise Http404()
 
         if settings.USE_S3_FOR_EXPORTS:
+            # protect the object for as long as the pre-signed url is valid
+            models.ExportDownloadLease.grant(export)
             url = export.export_data.url  # this is a pre-signed url by default, nice
             return redirect(url)
 
@@ -246,6 +255,8 @@ class ExportArchive(View):
             # not implemented
             return HttpResponseServerError()
 
+        # protect the published object while it is being streamed
+        models.ExportDownloadLease.grant(export)
         try:
             return HttpResponse(
                 export.export_data,

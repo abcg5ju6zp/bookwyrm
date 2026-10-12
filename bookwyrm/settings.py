@@ -532,6 +532,10 @@ USE_S3_FOR_EXPORTS = env.bool("USE_S3_FOR_EXPORTS", False)
 # This ensures we can secure use import/export files
 # for S3 services without ACL (e.g. Backblaze B2 or Cloudflare R2)
 S3_SIGNED_URL_EXPIRY = env.int("S3_SIGNED_URL_EXPIRY", 900)
+# how long an in-progress download protects a published export from cleanup
+EXPORT_DOWNLOAD_LEASE_SECONDS = env.int(
+    "EXPORT_DOWNLOAD_LEASE_SECONDS", S3_SIGNED_URL_EXPIRY
+)
 if USE_S3_FOR_EXPORTS:
     STORAGES["exports"] = {
         "BACKEND": "storages.backends.s3.S3Storage",
